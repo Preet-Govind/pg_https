@@ -1,0 +1,7 @@
+comment = 'HTTPs client extension for PostgreSQL'
+
+default_version = '1.0'
+
+relocatable = true
+module_pathname ='$libdir/pg_https'
+
