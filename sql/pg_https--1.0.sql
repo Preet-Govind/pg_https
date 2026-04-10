@@ -7,6 +7,9 @@ END $$;
 
 -- create extension pg_https ;
 
+drop schema if exists requests;
+
+create schema if not exists requests ;
 
 set pg_https.timeout = 20;
 set pg_https.connect_timeout = 30;
@@ -44,7 +47,7 @@ CREATE TYPE http_response AS (
 -- LANGUAGE C STRICT;
 
 -- ---
-create or replace function rest_request(
+create or replace function requests.rest_request(
     method text,
     url text,
     headers jsonb default null, body text default null,

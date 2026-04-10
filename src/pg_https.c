@@ -45,6 +45,7 @@ bool https_verify_peer = true;
 int pg_https_max_response_size = 10485760; // 10MB default
 char *pg_https_default_headers = NULL;
 
+char *pg_https_ca_file = NULL;
 
 extern void init_default_headers(void);
 
@@ -54,6 +55,14 @@ extern void init_default_headers(void);
  *      - register custom pg config var
  *      - init libcurl once per process
 */
+static bool
+check_hook_tls_version(int *newval, void **extra, GucSource source)
+{
+    if (*newval != 0 && *newval != 12 && *newval != 13)
+        return false;
+    return true;
+}
+
 void _PG_init(void)
 {
     // init_default_headers();// lazy init in https_execute()
@@ -105,7 +114,7 @@ void _PG_init(void)
         13,
         PGC_USERSET,
         0,
-        NULL,
+        check_hook_tls_version,
         NULL,
         NULL
     );
@@ -153,6 +162,18 @@ void _PG_init(void)
         NULL
     );
 
+    DefineCustomStringVariable(
+        "pg_https.ca_file",
+        "Custom CA bundle path",
+        NULL,
+        &pg_https_ca_file,
+        "",
+        PGC_USERSET,
+        0,
+        NULL,
+        NULL,
+        NULL
+    );
 }
 
 
@@ -194,6 +215,10 @@ Datum rest_request(PG_FUNCTION_ARGS)
     int retry_delay_ms = 100;
     double retry_backoff = 2.0;
 
+    // body valena fix
+    
+    int body_len = 0;
+
     /* ---- reqd args ---- */
     if (PG_ARGISNULL(0))
         ereport(ERROR, (errmsg("method cannot be NULL")));
@@ -214,13 +239,28 @@ Datum rest_request(PG_FUNCTION_ARGS)
 
     url    = text_to_cstring(url_text);
     
+    if(strlen(url) == 0 )
+        ereport(ERROR, (errmsg("URL cannot be NULL")));
+    
     // optional params
+    if (!https_verify_peer)
+    {
+        ereport(WARNING,
+            (errmsg("pg_https: SSL verification is disabled (insecure)")));
+    }
     if (PG_NARGS() > 2 && !PG_ARGISNULL(2))
         headers_jsonb = PG_GETARG_JSONB_P(2);
 
     if (PG_NARGS() > 3 && !PG_ARGISNULL(3))
-        body = text_to_cstring(PG_GETARG_TEXT_PP(3));
- 
+    {
+        // body = text_to_cstring(PG_GETARG_TEXT_PP(3));// it seems broken, text_to_string() forces null terminated string, strlen() stops at first \0
+        // so if req body contains binary data/json with \0 or compressed payloads , this might be truncated the request
+        // so replacing it by
+        text * body_text = PG_GETARG_TEXT_PP(3);
+        body_len = VARSIZE_ANY_EXHDR(body_text);//returns size of var len (varlena) data val excluding its header, pg's
+        body = VARDATA_ANY(body_text); // zero copy , faster safe within func life
+    }
+
     // timeout 
     // if (PG_NARGS() > 4 && !PG_ARGISNULL(4)) // earlier when arg index mapping was not done
     //     timeout_override = PG_GETARG_INT32(4);
@@ -265,11 +305,17 @@ Datum rest_request(PG_FUNCTION_ARGS)
     // res = https_execute(url, method, headers_jsonb, body, timeout_override);//creds added
     // res = https_execute(url, method, headers_jsonb, bod/y, timeout_override, username,password);// adding retry logic
     res = https_execute(
-                url, method, headers_jsonb, body,
+                url, method, headers_jsonb, body,body_len,
                 timeout_override, 
                 username, password,
                 retries, retry_delay_ms, retry_backoff
             );
+/* https_execute(
+    const char *url,const char *method,Jsonb *headers_jsonb,const char *req_body,int req_body_len,
+    const int timeout_override,
+    const char *username,const char *password,
+    int retries,int retry_delay_ms,double retry_backoff
+) */
 
     /* ---- Build response , what if its null , hence validate---- */
     if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
@@ -279,13 +325,14 @@ Datum rest_request(PG_FUNCTION_ARGS)
         ereport(ERROR, (errmsg("internal error: null response")));
     
     /* ---- logging slow or failing req , keeping it simple and light ---- */
-    ereport(LOG,
-        (errmsg("pg_https: %s %s --> %d (%d ms, %d bytes)",
-            method,
-            url,
-            res->status,
-            res->duration_ms,
-            res->response_bytes)));
+    if (res->duration_ms > 1000 || res->status >= 400)
+        ereport(LOG,
+            (errmsg("pg_https: %s %s --> %d (%d ms, %d bytes)",
+                method,
+                url,
+                res->status,
+                res->duration_ms,
+                res->response_bytes)));
 
 
     BlessTupleDesc(tupdesc);
