@@ -563,7 +563,7 @@ https_execute(
 
     
     curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "pg_https/1.0");
+    curl_easy_setopt(curl, CURLOPT_USERAGENT, "pg_https/1.1");
     
     curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); //libcurl may use signals
     

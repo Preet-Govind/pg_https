@@ -8,7 +8,7 @@ MODULE_big = pg_https
 OBJS = src/pg_https.o src/https_core.o
 
 
-DATA = sql/pg_https--1.0.sql
+DATA = sql/pg_https--1.1.sql
 
 PG_CONFIG = pg_config
 PGXS := $(shell $(PG_CONFIG) --pgxs)
