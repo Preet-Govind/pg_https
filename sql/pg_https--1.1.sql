@@ -14,8 +14,8 @@ create schema if not exists requests ;
 set pg_https.timeout = 20;
 set pg_https.connect_timeout = 30;
 
-set pg_https.tls_version = 12;
-set pg_https.verify_peer = false;
+set pg_https.tls_version = 13;--tls 1.3 , use 12 for 1.2
+set pg_https.verify_peer = true; -- false validate ssl cert
 
 -- set pg_https.has_auth_header = false; // breaks per request correctness
 
