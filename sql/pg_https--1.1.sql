@@ -7,7 +7,7 @@ END $$;
 
 -- create extension pg_https ;
 
-drop schema if exists requests;
+-- drop schema if exists requests;
 
 create schema if not exists requests ;
 
