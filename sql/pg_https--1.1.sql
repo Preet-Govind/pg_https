@@ -7,22 +7,22 @@ END $$;
 
 -- create extension pg_https ;
 
-drop schema if exists requests;
+-- drop schema if exists requests;
 
 create schema if not exists requests ;
 
 set pg_https.timeout = 20;
 set pg_https.connect_timeout = 30;
 
-set pg_https.tls_version = 12;
-set pg_https.verify_peer = false;
+set pg_https.tls_version = 13;--tls 1.3 , use 12 for 1.2
+set pg_https.verify_peer = true; -- false validate ssl cert
 
 -- set pg_https.has_auth_header = false; // breaks per request correctness
 
--- SET pg_https.default_headers = '{"User-Agent": "pg_https/1.0"}';
+-- SET pg_https.default_headers = '{"User-Agent": "pg_https/1.1"}';
 -- SET pg_https.default_headers = '{"Content-Type":"application/json"}';
 
-SET pg_https.default_headers = '{"User-Agent": "pg_https/1.0","Content-Type":"application/json"}';
+SET pg_https.default_headers = '{"User-Agent": "pg_https/1.1","Content-Type":"application/json"}';
 
 set pg_https.max_response_size = 10485760 ; -- 10 MB
 

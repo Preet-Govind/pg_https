@@ -3,3 +3,5 @@
 /src/*.so
 /src/*.o
 /src/*.bc
+
+*.json
