@@ -72,7 +72,14 @@ progress_callback(void *clientp,
                   curl_off_t dltotal, curl_off_t dlnow,
                   curl_off_t ultotal, curl_off_t ulnow)
 {
-    CHECK_FOR_INTERRUPTS();  // allow cancel / statement_timeout
+    // CHECK_FOR_INTERRUPTS();  // allow cancel / statement_timeout
+    // return 0;
+    /*
+     * not checking INTR here , does a longjmp() from libcurl , which skips curls internal clean up and causing leaking the handle ssl ctx and socket
+     * instead , sig libcurl to abort by non-0 , curl_easy_perform will then ret CURLE_ABORTED_BY_CALLBACK and then we will check for INTR
+    */
+    if (QueryCancelPending || ProcDiePending)
+        return 1;
     return 0;
 }
 
@@ -397,7 +404,8 @@ is_idempotent(const char *method)
         pg_strcasecmp(method, "GET") == 0 ||
         pg_strcasecmp(method, "HEAD") == 0 ||
         pg_strcasecmp(method, "PUT") == 0 ||
-        pg_strcasecmp(method, "DELETE") == 0
+        pg_strcasecmp(method, "DELETE") == 0 ||
+        pg_strcasecmp(method, "OPTIONS") == 0   /* got in RFC */
     );
 }
 
@@ -422,6 +430,18 @@ is_retryable(CURLcode res)
     }
 }
 
+static void
+sleepy(long delay , long jitter)
+{
+    long remaining_us = (long)(delay + jitter) * 1000L;// us = micro sec
+    const long chunk_us = 100000L;  /* 100ms chunks */
+    while (remaining_us > 0)
+    {
+        CHECK_FOR_INTERRUPTS();  /* safe here — not inside libcurl */
+        pg_usleep(Min(chunk_us, remaining_us));
+        remaining_us -= chunk_us;
+    }
+}
 /*
  *  main http req execution 
  *      - builds headers (default + user)
@@ -479,413 +499,452 @@ https_execute(
 
     CURL *curl = curl_easy_init();
     if (!curl)
+    {
+        MemoryContextSwitchTo(old_ctx);
+        MemoryContextDelete(req_ctx);
         ereport(ERROR, (errmsg("Failed to init curl")));
-
-    // parse default headers per req
-    if (pg_https_default_headers && strlen(pg_https_default_headers) > 0)
-    {
-        default_headers_jsonb = DatumGetJsonbP(
-            DirectFunctionCall1(jsonb_in,
-                CStringGetDatum(pg_https_default_headers)));
     }
-
-    // default_headers_jsonb = cached_default_headers;
-
-    // append user headers to default headers
-    default_list = build_headers(default_headers_jsonb, &default_has_auth);
-    user_list    = build_headers(headers_jsonb, &user_has_auth);
-
-    has_auth_header = user_has_auth || default_has_auth;
-    // moving this logic to merge_headers()    
-    // if (default_list)
-    // {
-    //     curl_headers = default_list;
-
-    //     if (user_list)
-    //     {
-    //         struct curl_slist *tmp = default_list;
-    //         while (tmp->next)
-    //             tmp = tmp->next;
-
-    //         tmp->next = user_list;
-    //     }
-    // }
-    // else
-    // {
-    //     curl_headers = user_list;
-    // }
-    curl_headers = merge_headers(default_list,user_list);
-    // default_list = NULL; // dumb ways to deal with ptr
-    // user_list = NULL;
-
-    initStringInfo(&response_body.data);
-    initStringInfo(&response_headers.data);
-
-    clock_gettime(CLOCK_MONOTONIC, &start);
-
-    // ---- curl config ----
-    if (!url || strlen(url) == 0)
-        ereport(ERROR, (errmsg("URL cannot be empty")));
-    curl_easy_setopt(curl, CURLOPT_URL, url);
-
-
-    curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
-    curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &response_body);
-
-    curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
-    curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void *) &response_headers);
-
-    // curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
-    curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, https_connect_timeout);// GUC defined
-    // curl_easy_setopt(curl, CURLOPT_TIMEOUT, https_timeout);// GUC defined
-
-    if (timeout_override > 0)
-        effective_timeout = timeout_override;
-
-    // prevents long blocking inside db backend
-    if (effective_timeout > 30)
+    PG_TRY();
     {
-        ereport(WARNING, (errmsg("pg_https: timeout clamped to 30s (requested: %ds)", effective_timeout)));
-        effective_timeout = 30;
-    }
-    curl_easy_setopt(curl, CURLOPT_TIMEOUT, effective_timeout);
-
-
-
-    // TLS/ssl verion handling
-    // curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);//deprecated ,vars added now
-    if (https_tls_version == 12)
-        curl_tls_version = CURL_SSLVERSION_TLSv1_2;
-    else if (https_tls_version == 13)
-        curl_tls_version = CURL_SSLVERSION_TLSv1_3;
-    else if (https_tls_version != 0)
-        ereport(ERROR,
-            (errmsg("invalid tls_version: %d", https_tls_version)));
-
-    /*verify peer */
-    /* Safe defaults */
-    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
-    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
-    // no more needed, can be adjusted from PG
-    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, https_verify_peer ? 1L : 0L);
-    // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, https_verify_peer ? 2L : 0L); // what if i split VERIFYHOST and VERIFYPEER
-
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,https_verify_peer ? 1L : 0L);
-
-    curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,https_verify_peer ? 2L : 0L);
-    
-    curl_easy_setopt(curl, CURLOPT_SSLVERSION, curl_tls_version);
-
-    // ca
-    if (pg_https_ca_file && strlen(pg_https_ca_file) > 0)
-    {
-        curl_easy_setopt(curl, CURLOPT_CAINFO, pg_https_ca_file);
-    }
-    /* HTTP/2 */
-    curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
-
-    /* ALPN */
-    curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
-
-    /* Compression, sys default */
-    curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
-
-    /* Interrupt + hang fix */
-    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
-    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
-
-    /* prevent slow/stall/hanging conns */
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // bytes/sec
-    curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, effective_timeout);   // seconds
-
-    
-    curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
-    curl_easy_setopt(curl, CURLOPT_USERAGENT, "pg_https/1.1");
-    
-    curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); //libcurl may use signals
-    
-    /* ---- headers ---- */
-
-    // curl_headers = build_headers(headers_jsonb,&has_auth_header);
-
-    if (curl_headers)
-        curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
-
-    // apply basic auth only if no auth header 
-
-    // if (username)// what if only username reqd
-    // if (username && *username)//avoidinf empty strings
-    if (!has_auth_header && username && *username)//if auth avail
-    {
-        curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
-        curl_easy_setopt(curl, CURLOPT_USERNAME, username);
-
-        if (password)
-            curl_easy_setopt(curl, CURLOPT_PASSWORD, password);
-    }
-
-    //  method handling (GET, POST, PUT DELETE PATCH)
-     
-    // if (method && strcmp(method, "POST") == 0)
-    // {
-    //     curl_easy_setopt(curl, CURLOPT_POST, 1L);
-
-    //     if (req_body)
-    //         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
-    // }
-    // else
-    // {
-    //     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    // }
-    if (!method)
-        ereport(ERROR, (errmsg("HTTP method cannot be NULL")));
-
-    // if (strcmp(method, "GET") == 0)
-    if (pg_strcasecmp(method, "GET") == 0)
-    {
-        curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
-    }
-    else
-    {
-        curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
-
-        // if (req_body)
-        //     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
-        // explicitly set size because payload may contain binary or null bytes
-        if (req_body && req_body_len > 0 )//curl assumes null terminated string,breaks for binary payloads,josn with embedded nulls
+        // parse default headers per req
+        if (pg_https_default_headers && strlen(pg_https_default_headers) > 0)
         {
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
-            // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_body));
-            // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) strlen(req_body));// taken req_body_len, passed in param
-            // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) req_bod_len);// fix
-            curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) req_body_len);//avoids larger payloads
+            default_headers_jsonb = DatumGetJsonbP(
+                DirectFunctionCall1(jsonb_in,
+                    CStringGetDatum(pg_https_default_headers)));
         }
-    }
 
-    // retry loop with perform request & check res
-    // res = curl_easy_perform(curl); // libcurl request // adding retry logic
-    int max_delay = 5000;  // 5 seconds cap , retry
-    char errbuf[CURL_ERROR_SIZE];
-    errbuf[0] = '\0';
-    curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
+        // default_headers_jsonb = cached_default_headers;
 
-    for (attempt = 0; attempt <= retries; attempt++)
-    {
-        // response_body.data.len = 0;
-        // response_headers.data.len = 0;
-        if (attempt > 0)//just for debugging
+        // append user headers to default headers
+        default_list = build_headers(default_headers_jsonb, &default_has_auth);
+        user_list    = build_headers(headers_jsonb, &user_has_auth);
+
+        has_auth_header = user_has_auth || default_has_auth;
+        // moving this logic to merge_headers()    
+        // if (default_list)
+        // {
+        //     curl_headers = default_list;
+
+        //     if (user_list)
+        //     {
+        //         struct curl_slist *tmp = default_list;
+        //         while (tmp->next)
+        //             tmp = tmp->next;
+
+        //         tmp->next = user_list;
+        //     }
+        // }
+        // else
+        // {
+        //     curl_headers = user_list;
+        // }
+        curl_headers = merge_headers(default_list,user_list);
+        // default_list = NULL; // dumb ways to deal with ptr
+        // user_list = NULL;
+
+        initStringInfo(&response_body.data);
+        initStringInfo(&response_headers.data);
+
+        clock_gettime(CLOCK_MONOTONIC, &start);
+
+        // ---- curl config ----
+        if (!url || strlen(url) == 0)
+            ereport(ERROR, (errmsg("URL cannot be empty")));
+        curl_easy_setopt(curl, CURLOPT_URL, url);
+
+
+        curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_callback);
+        curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *) &response_body);
+
+        curl_easy_setopt(curl, CURLOPT_HEADERFUNCTION, header_callback);
+        curl_easy_setopt(curl, CURLOPT_HEADERDATA, (void *) &response_headers);
+
+        // curl_easy_setopt(curl, CURLOPT_TIMEOUT, 10L);
+        curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, https_connect_timeout);// GUC defined
+        // curl_easy_setopt(curl, CURLOPT_TIMEOUT, https_timeout);// GUC defined
+
+        if (timeout_override > 0)
+            effective_timeout = timeout_override;
+
+        // prevents long blocking inside db backend
+        // if (effective_timeout > 30)
+        // {
+        //     ereport(WARNING, (errmsg("pg_https: timeout clamped to 30s (requested: %ds)", effective_timeout)));
+        //     effective_timeout = 30;
+        // }
+        curl_easy_setopt(curl, CURLOPT_TIMEOUT, effective_timeout);
+
+
+
+        // TLS/ssl verion handling
+        // curl_easy_setopt(curl, CURLOPT_SSLVERSION, CURL_SSLVERSION_TLSv1_2);//deprecated ,vars added now
+        if (https_tls_version == 12)
+            curl_tls_version = CURL_SSLVERSION_TLSv1_2;
+        else if (https_tls_version == 13)
+            curl_tls_version = CURL_SSLVERSION_TLSv1_3;
+        else if (https_tls_version != 0)
+            ereport(ERROR,
+                (errmsg("invalid tls_version: %d", https_tls_version)));
+
+        /*verify peer */
+        /* Safe defaults */
+        // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
+        // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, 2L);
+        // no more needed, can be adjusted from PG
+        // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, https_verify_peer ? 1L : 0L);
+        // curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST, https_verify_peer ? 2L : 0L); // what if i split VERIFYHOST and VERIFYPEER
+
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER,https_verify_peer ? 1L : 0L);
+
+        curl_easy_setopt(curl, CURLOPT_SSL_VERIFYHOST,https_verify_peer ? 2L : 0L);
+        
+        curl_easy_setopt(curl, CURLOPT_SSLVERSION, curl_tls_version);
+
+        // ca
+        if (pg_https_ca_file && strlen(pg_https_ca_file) > 0)
         {
-            ereport(LOG,
-                (errmsg("pg_https retry %d for %s %s",
-                    attempt, method, url)));
+            curl_easy_setopt(curl, CURLOPT_CAINFO, pg_https_ca_file);
         }
-        CHECK_FOR_INTERRUPTS();
-        // response_body.data.len = 0;
-        // response_headers.data.len = 0; 
-        //cleaner overwrite, i guess although i doubt StringInfo
-        resetStringInfo(&response_body.data);
-        resetStringInfo(&response_headers.data);
+        /* HTTP/2 */
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
 
+        /* ALPN */
+        curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
 
-        res = curl_easy_perform(curl);
+        /* Compression, sys default */
+        curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
-        ereport(LOG, (errmsg("pg_https: curl : attempt %d ,result=%d (%s)",attempt, res, curl_easy_strerror(res))));
+        /* Interrupt + hang fix */
+        curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
+        curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+        /* prevent slow/stall/hanging conns */
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // bytes/sec
+        curl_easy_setopt(curl, CURLOPT_LOW_SPEED_TIME, https_connect_timeout);   // seconds
+
         
+        curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
+        curl_easy_setopt(curl, CURLOPT_USERAGENT, "pg_https/1.1");
         
+        curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); //libcurl may use signals
         
-        if (res == CURLE_OK)
+        /* ---- headers ---- */
+
+        // curl_headers = build_headers(headers_jsonb,&has_auth_header);
+
+        if (curl_headers)
+            curl_easy_setopt(curl, CURLOPT_HTTPHEADER, curl_headers);
+
+        // apply basic auth only if no auth header 
+
+        // if (username)// what if only username reqd
+        // if (username && *username)//avoidinf empty strings
+        if (!has_auth_header && username && *username)//if auth avail
         {
-            curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-        
-            // if (http_code < 500)
-            if (http_code < 500 &&
-                    http_code != 408 &&
-                    http_code != 429)
-                break;
+            curl_easy_setopt(curl, CURLOPT_HTTPAUTH, CURLAUTH_BASIC);
+            curl_easy_setopt(curl, CURLOPT_USERNAME, username);
 
-            if (!is_idempotent(method))
-                break;
+            if (password)
+                curl_easy_setopt(curl, CURLOPT_PASSWORD, password);
+        }
+
+        //  method handling (GET, POST, PUT DELETE PATCH)
+        
+        // if (method && strcmp(method, "POST") == 0)
+        // {
+        //     curl_easy_setopt(curl, CURLOPT_POST, 1L);
+
+        //     if (req_body)
+        //         curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
+        // }
+        // else
+        // {
+        //     curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
+        // }
+        if (!method)
+            ereport(ERROR, (errmsg("HTTP method cannot be NULL")));
+
+        // if (strcmp(method, "GET") == 0)
+        if (pg_strcasecmp(method, "GET") == 0)
+        {
+            curl_easy_setopt(curl, CURLOPT_HTTPGET, 1L);
         }
         else
         {
-            if (!is_retryable(res) || !is_idempotent(method))
-                break;
+            curl_easy_setopt(curl, CURLOPT_CUSTOMREQUEST, method);
+
+            // if (req_body)
+            //     curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
+            // explicitly set size because payload may contain binary or null bytes
+            if (req_body && req_body_len > 0 )//curl assumes null terminated string,breaks for binary payloads,josn with embedded nulls
+            {
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDS, req_body);
+                // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, strlen(req_body));
+                // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) strlen(req_body));// taken req_body_len, passed in param
+                // curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long) req_bod_len);// fix
+                curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE_LARGE, (curl_off_t) req_body_len);//avoids larger payloads
+            }
         }
 
-        if (attempt == retries)
-            break;
+        // retry loop with perform request & check res
+        // res = curl_easy_perform(curl); // libcurl request // adding retry logic
+        int max_delay = 5000;  // 5 seconds cap , retry
+        char errbuf[CURL_ERROR_SIZE];
+        errbuf[0] = '\0';
+        curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);
 
-        // pg_usleep(delay * 1000);
-        // delay = (int)(delay * retry_backoff);
-        // int jitter = random() % 100;  // 0–99 ms jitter , check - pg gaurantees seeded random()  
-        int jitter = pg_prng_uint32(&pg_global_prng_state) % 100;//srandom may return void
-        CHECK_FOR_INTERRUPTS();
-        delay = (int)(delay * retry_backoff);
-        pg_usleep((delay + jitter) * 1000);
+        for (attempt = 0; attempt <= retries; attempt++)
+        {
+            // response_body.data.len = 0;
+            // response_headers.data.len = 0;
+            if (attempt > 0)//just for debugging
+            {
+                ereport(LOG,
+                    (errmsg("pg_https retry %d for %s %s",
+                        attempt, method, url)));
+            }
+            CHECK_FOR_INTERRUPTS();
+            // response_body.data.len = 0;
+            // response_headers.data.len = 0; 
+            //cleaner overwrite, i guess although i doubt StringInfo
+            resetStringInfo(&response_body.data);
+            resetStringInfo(&response_headers.data);
+            http_code = 0;
 
-        if (delay > max_delay)
-            delay = max_delay;
-    }
- 
-    // write to abort due to size limit
-    if (res == CURLE_WRITE_ERROR)
-    {
-        // MemoryContextSwitchTo(old_ctx);
-        // if (curl_headers)
-        //     curl_slist_free_all(curl_headers);
+            res = curl_easy_perform(curl);
 
-        // curl_easy_cleanup(curl);
-        ereport(ERROR, (errmsg("response too large")));
-        // if (curl)
-        //     curl_easy_cleanup(curl);// in cleanup
-        
-        // goto cleanup;
+            ereport(LOG, (errmsg("pg_https: curl : attempt %d ,result=%d (%s)",attempt, res, curl_easy_strerror(res))));
+            
+            
+            if (res == CURLE_ABORTED_BY_CALLBACK)
+            {
+                MemoryContextSwitchTo(old_ctx);
+                result = palloc0(sizeof(https_result));
+                result->curl_error_code = CURLE_ABORTED_BY_CALLBACK;
+                result->error_message = pstrdup("query cancelled");
+                result->headers = DatumGetJsonbP(
+                    DirectFunctionCall1(jsonb_in, CStringGetDatum("{}")));
+
+                /* curl is done, goto cleanup will run curl_easy_cleanup properly */
+                goto cleanup;
+                /* After cleanup, CHECK_FOR_INTERRUPTS will throw the actual cancel error */
+            }
+            if (res == CURLE_OK)
+            {
+                curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+            
+                // if (http_code < 500)
+                if (http_code < 500 &&
+                        http_code != 408 &&
+                        http_code != 429)
+                    break;
+
+                if (!is_idempotent(method))
+                    break;
+            }
+            else
+            {
+                if (!is_retryable(res) || !is_idempotent(method))
+                    break;
+            }
+
+            if (attempt == retries)
+                break;
+
+            // pg_usleep(delay * 1000);
+            // delay = (int)(delay * retry_backoff);
+            // int jitter = random() % 100;  // 0–99 ms jitter , check - pg gaurantees seeded random()  
+            int jitter = pg_prng_uint32(&pg_global_prng_state) % 100;//srandom may return void
+            // CHECK_FOR_INTERRUPTS();
+
+            // pg_usleep((delay + jitter) * 1000); // delya 1st
+            // delay = (int)(delay * retry_backoff);// inc delay for next attempt
+            sleepy(jitter,delay);
+            delay = (int)(delay*retry_backoff);
+            if (delay > max_delay)
+                delay = max_delay;
+        }
     
-    }
-    // return struct err instead of simple err
-    if (res != CURLE_OK)
-    {
-        MemoryContextSwitchTo(old_ctx);
-        result = palloc(sizeof(https_result));
+        // write to abort due to size limit
+        if (res == CURLE_WRITE_ERROR)
+        {
+            // MemoryContextSwitchTo(old_ctx);
+            // if (curl_headers)
+            //     curl_slist_free_all(curl_headers);
 
-        memset(result,0,sizeof(https_result));
-
-        result->status = 0;
-        // result->body = psprintf("curl error: %s", curl_easy_strerror(res));//might be lossing error buf details
-        result->body = psprintf("curl error: %s | %s", curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
+            // curl_easy_cleanup(curl);
+            // ereport(ERROR, (errmsg("response too large"))); // i was doing this only earlier
+            
+            // now
+            MemoryContextSwitchTo(old_ctx);
+            result = palloc0(sizeof(https_result));
+            result->status = 0;
+            result->curl_error_code = res;
+            result->error_message = pstrdup("response exceeded max_response_size limit");
+            result->headers = DatumGetJsonbP(
+                DirectFunctionCall1(jsonb_in, CStringGetDatum("{}")));
+            goto cleanup;
         
-        // result->headers = NULL;
-        result->headers = DatumGetJsonbP(
-            DirectFunctionCall1(jsonb_in, CStringGetDatum("{}"))
-        );// always return json
-        result->duration_ms = 0;
-        result->response_bytes = 0;
+        }
+        // return struct err instead of simple err
+        if (res != CURLE_OK)
+        {
+            MemoryContextSwitchTo(old_ctx);
+            result = palloc(sizeof(https_result));
 
-        result->curl_error_code=res ;
-        // result->error_message = pstrdup(result->body);
+            memset(result,0,sizeof(https_result));
+
+            result->status = 0;
+            // result->body = psprintf("curl error: %s", curl_easy_strerror(res));//might be lossing error buf details
+            result->body = psprintf("curl error: %s | %s", curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
+            
+            // result->headers = NULL;
+            result->headers = DatumGetJsonbP(
+                DirectFunctionCall1(jsonb_in, CStringGetDatum("{}"))
+            );// always return json
+            result->duration_ms = 0;
+            result->response_bytes = 0;
+
+            result->curl_error_code=res ;
+            // result->error_message = pstrdup(result->body);
 
 
-        // if (curl_headers)
-        //     curl_slist_free_all(curl_headers);// in clean up 
+            // if (curl_headers)
+            //     curl_slist_free_all(curl_headers);// in clean up 
 
-        // curl_easy_cleanup(curl);
-        // curl = NULL;
+            // curl_easy_cleanup(curl);
+            // curl = NULL;
+            goto cleanup;
+
+            // return result;// i think its going to be unreachable
+        }
+
+        curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
+
+        clock_gettime(CLOCK_MONOTONIC, &end);//stats
+
+        duration_ms =
+            (end.tv_sec - start.tv_sec) * 1000 +
+            (end.tv_nsec - start.tv_nsec) / 1000000;
+
+        /* ---- build result ---- */
+        MemoryContextSwitchTo(old_ctx) ;// switch back to old context
+        result = palloc(sizeof(https_result));// creating result struct 
+
+        //populating the result struct
+        result->status = (int) http_code;
+
+        // result->body = pstrdup(response_body.data.data); // user len aware copy, resp may contain binary/null
+        // result->body = pnstrdup(response_body.data.data, response_body.data.len);
+        if (response_body.data.data && response_body.data.len > 0)
+            result->body = pnstrdup(response_body.data.data, response_body.data.len);
+        else
+            result->body = pstrdup("");
+
+        result->error_message = (res == CURLE_OK) ? NULL : psprintf("curl error (%d): %s | detail: %s",res,curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
+        // found headers stored as JSONB with raw field
+        // result->headers = pstrdup(response_headers.data.data);
+        // char *headers_copy = pstrdup(response_headers.data.data);
+
+        // headers_copy = palloc(response_headers.data.len + 1);
+        // memcpy(headers_copy, response_headers.data.data, response_headers.data.len);//data = NULL and len == 0 then it may contribute to crash
+        // so 
+        if (response_headers.data.len > 0 && response_headers.data.data)
+        {
+            headers_copy = palloc(response_headers.data.len + 1);
+            memcpy(headers_copy, response_headers.data.data, response_headers.data.len);
+            headers_copy[response_headers.data.len] = '\0';
+        }
+        else
+        {
+            headers_copy = pstrdup("");
+        }
+        // headers_copy[response_headers.data.len] = '\0';// can cause seg fault
+        
+        // HTAB *map = parse_headers_to_map(headers_copy);
+        // result->headers = headers_map_to_jsonb(map);
+        // hash_destroy(map);
+        pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
+    //pushJsonbValue expects state to be managed internally but if anythin fails or mem cntxt switches or partial exe then  , hence state=null
+        
+        key.type = jbvString;
+        key.val.string.val = "raw";
+        key.val.string.len = 3;
+
+        val.type = jbvString;
+        // val.val.string.val = headers_copy;//using pfree
+        // val.val.string.val = pnstrdup(headers_copy, strlen(headers_copy));//for safety
+        // val.val.string.len = strlen(headers_copy);
+        // val.val.string.val = pnstrdup(headers_copy, response_headers.data.len);// if \0 contained in header , truncate using strlen() ---> mismatch btwn actual buffer and len 
+        // val.val.string.len = response_headers.data.len;//does not help when url unreachable - check
+        int hdr_len = response_headers.data.len; // c90 move declarations
+        if(!headers_copy || hdr_len <=0)
+        {
+            // hdr_len = 0 ; // its ptr !!
+            val.val.string.len = 0;
+            val.val.string.val = "" ; 
+        }
+        else
+        {
+                val.val.string.val = pnstrdup(headers_copy, hdr_len);
+                val.val.string.len = hdr_len;
+        }
+        // val.val.string.val = pnstrdup(headers_copy, hdr_len);
+        // val.val.string.len = hdr_len;
+
+        pushJsonbValue(&state, WJB_KEY, &key);
+        pushJsonbValue(&state, WJB_VALUE, &val);
+
+        JsonbValue *jb_res = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
+        if (!jb_res)
+            ereport(ERROR, (errmsg("failed to build jsonb headers")));
+        
+        result->headers = JsonbValueToJsonb(jb_res);
+
+        result->duration_ms = duration_ms;
+        result->response_bytes = response_body.data.len;
+        result->curl_error_code = res;
+        // result->error_message = pstrdup(curl_easy_strerror(res));//no context
+        // result->error_message = psprintf("curl error (%d): %s",res,curl_easy_strerror(res)); // added context
+
+
         goto cleanup;
-
-        // return result;// i think its going to be unreachable
-    }
-
-    curl_easy_getinfo(curl, CURLINFO_RESPONSE_CODE, &http_code);
-
-    clock_gettime(CLOCK_MONOTONIC, &end);//stats
-
-    duration_ms =
-        (end.tv_sec - start.tv_sec) * 1000 +
-        (end.tv_nsec - start.tv_nsec) / 1000000;
-
-    /* ---- build result ---- */
-    MemoryContextSwitchTo(old_ctx) ;// switch back to old context
-    result = palloc(sizeof(https_result));// creating result struct 
-
-    //populating the result struct
-    result->status = (int) http_code;
-
-    // result->body = pstrdup(response_body.data.data); // user len aware copy, resp may contain binary/null
-    // result->body = pnstrdup(response_body.data.data, response_body.data.len);
-    if (response_body.data.data && response_body.data.len > 0)
-        result->body = pnstrdup(response_body.data.data, response_body.data.len);
-    else
-        result->body = pstrdup("");
-
-    result->error_message = (res == CURLE_OK) ? NULL : psprintf("curl error (%d): %s | detail: %s",res,curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
-    // found headers stored as JSONB with raw field
-    // result->headers = pstrdup(response_headers.data.data);
-    // char *headers_copy = pstrdup(response_headers.data.data);
-
-    // headers_copy = palloc(response_headers.data.len + 1);
-    // memcpy(headers_copy, response_headers.data.data, response_headers.data.len);//data = NULL and len == 0 then it may contribute to crash
-    // so 
-    if (response_headers.data.len > 0 && response_headers.data.data)
-    {
-        headers_copy = palloc(response_headers.data.len + 1);
-        memcpy(headers_copy, response_headers.data.data, response_headers.data.len);
-        headers_copy[response_headers.data.len] = '\0';
-    }
-    else
-    {
-        headers_copy = pstrdup("");
-    }
-    // headers_copy[response_headers.data.len] = '\0';// can cause seg fault
-    
-    // HTAB *map = parse_headers_to_map(headers_copy);
-    // result->headers = headers_map_to_jsonb(map);
-    // hash_destroy(map);
-    pushJsonbValue(&state, WJB_BEGIN_OBJECT, NULL);
-   //pushJsonbValue expects state to be managed internally but if anythin fails or mem cntxt switches or partial exe then  , hence state=null
-    
-    key.type = jbvString;
-    key.val.string.val = "raw";
-    key.val.string.len = 3;
-
-    val.type = jbvString;
-    // val.val.string.val = headers_copy;//using pfree
-    // val.val.string.val = pnstrdup(headers_copy, strlen(headers_copy));//for safety
-    // val.val.string.len = strlen(headers_copy);
-    // val.val.string.val = pnstrdup(headers_copy, response_headers.data.len);// if \0 contained in header , truncate using strlen() ---> mismatch btwn actual buffer and len 
-    // val.val.string.len = response_headers.data.len;//does not help when url unreachable - check
-    int hdr_len = response_headers.data.len; // c90 move declarations
-    if(!headers_copy || hdr_len <=0)
-    {
-        // hdr_len = 0 ; // its ptr !!
-        val.val.string.len = 0;
-        val.val.string.val = "" ; 
-    }
-    else
-    {
-            val.val.string.val = pnstrdup(headers_copy, hdr_len);
-            val.val.string.len = hdr_len;
-    }
-    // val.val.string.val = pnstrdup(headers_copy, hdr_len);
-    // val.val.string.len = hdr_len;
-
-    pushJsonbValue(&state, WJB_KEY, &key);
-    pushJsonbValue(&state, WJB_VALUE, &val);
-
-    JsonbValue *jb_res = pushJsonbValue(&state, WJB_END_OBJECT, NULL);
-    if (!jb_res)
-        ereport(ERROR, (errmsg("failed to build jsonb headers")));
-    
-    result->headers = JsonbValueToJsonb(jb_res);
-
-    result->duration_ms = duration_ms;
-    result->response_bytes = response_body.data.len;
-    result->curl_error_code = res;
-    // result->error_message = pstrdup(curl_easy_strerror(res));//no context
-    // result->error_message = psprintf("curl error (%d): %s",res,curl_easy_strerror(res)); // added context
-
-
-    goto cleanup;
-    /* ---- cleanup/free mem ---- */
-    cleanup:
-        // MemoryContextSwitchTo(old_ctx);
-        if (curl_headers)
-            curl_slist_free_all(curl_headers);
-        if (headers_copy)
-            pfree(headers_copy);
-    
-        // curl_easy_cleanup(curl);
-        if (curl)
-            curl_easy_cleanup(curl);
-        // NOW using mem context        
-        // if (response_body.data.data)
-        //     pfree(response_body.data.data);
-
-        // if (response_headers.data.data)
-        //     pfree(response_headers.data.data);
-
-        // if(default_headers_jsonb)
-        // pfree(default_headers_jsonb);//freeing a mem which pg expects to exists might be making pg recovery mode , SIGSEGV
+        /* ---- cleanup/free mem ---- */
+        cleanup:
+            // MemoryContextSwitchTo(old_ctx);
+            if (curl_headers)
+                curl_slist_free_all(curl_headers);
+            if (headers_copy)
+                pfree(headers_copy);
         
-        MemoryContextDelete(req_ctx);// context clean up 
+            // curl_easy_cleanup(curl);
+            if (curl)
+                curl_easy_cleanup(curl);
+            // NOW using mem context        
+            // if (response_body.data.data)
+            //     pfree(response_body.data.data);
+
+            // if (response_headers.data.data)
+            //     pfree(response_headers.data.data);
+
+            // if(default_headers_jsonb)
+            // pfree(default_headers_jsonb);//freeing a mem which pg expects to exists might be making pg recovery mode , SIGSEGV
+            
+            MemoryContextDelete(req_ctx);// context clean up 
+            // CHECK_FOR_INTERRUPTS();
+            
+        }
+        PG_CATCH();
+        {
+            if (curl)   curl_easy_cleanup(curl);
+            if (curl_headers)   curl_slist_free_all(curl_headers);
+            MemoryContextSwitchTo(old_ctx);
+            MemoryContextDelete(req_ctx);
+            PG_RE_THROW();
+        }
+        PG_END_TRY();
+
+        CHECK_FOR_INTERRUPTS(); 
         return result;
 }

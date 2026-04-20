@@ -81,7 +81,7 @@ void _PG_init(void)
         &https_timeout,
         10,     /* default */
         1,      /* min */
-        300,    /* max */
+        3600,    /* max */
         PGC_USERSET,
         0,
         NULL,
@@ -96,7 +96,7 @@ void _PG_init(void)
         &https_connect_timeout,
         5,
         1,
-        60,
+        360,
         PGC_USERSET,
         0,
         NULL,
