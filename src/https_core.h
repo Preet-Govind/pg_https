@@ -57,6 +57,7 @@ https_result* https_execute(
     int timeout_override ,
     const char *username,const char *password
     ,int retries,int retry_delay_ms,double retry_backoff
+    ,int cancel_mode
 );
 
 
@@ -67,6 +68,14 @@ extern int https_timeout ; // req timeout sec
 extern int https_connect_timeout ; // conn timeout sec
 extern int https_tls_version; // TLS version selector
 extern bool https_verify_peer; // SSL certificate verfication 
+
+extern int pg_https_tcp_keepalive;//keep alive tcp 
+
+typedef enum
+{
+    HTTPS_CANCEL_ABORT = 0,
+    HTTPS_CANCEL_WAIT  = 1
+} https_cancel_mode;
 
 /* 
  * mem :

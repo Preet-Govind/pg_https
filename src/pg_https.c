@@ -26,6 +26,8 @@
 #define ARG_RETRIES 7
 #define ARG_RETRY_DELAY 8
 #define ARG_RETRY_BACKOFF 9
+#define ARG_CANCEL_MODE 10
+// #define ARG_TCP_KEEPALIVE 11 // INT
 
 PG_MODULE_MAGIC;
 
@@ -43,9 +45,13 @@ int https_tls_version = 0;
 bool https_verify_peer = true;
 
 int pg_https_max_response_size = 10485760; // 10MB default
+
+
 char *pg_https_default_headers = NULL;
 
 char *pg_https_ca_file = NULL;
+
+int pg_https_tcp_keepalive = 120 ; // sec default
 
 extern void init_default_headers(void);
 
@@ -81,7 +87,7 @@ void _PG_init(void)
         &https_timeout,
         10,     /* default */
         1,      /* min */
-        3600,    /* max */
+        36000,    /* max */
         PGC_USERSET,
         0,
         NULL,
@@ -134,18 +140,19 @@ void _PG_init(void)
     );
 
     /* ---- default headers stored as json string and parsed later during req execution (lazy init) ---- */
-    DefineCustomStringVariable(
-    "pg_https.default_headers",
-    "Default HTTP headers (JSON)",
-    NULL,
-    &pg_https_default_headers,
-    "",
-    PGC_USERSET,
-    0,
-    NULL,
-    NULL,
-    NULL
-);
+    DefineCustomStringVariable
+    (
+        "pg_https.default_headers",
+        "Default HTTP headers (JSON)",
+        NULL,
+        &pg_https_default_headers,
+        "",
+        PGC_USERSET,
+        0,
+        NULL,
+        NULL,
+        NULL
+    );
     /* ---- hard safety cap to avoid unbounded mem usage ---- */
     DefineCustomIntVariable(
         "pg_https.max_response_size",
@@ -168,6 +175,21 @@ void _PG_init(void)
         NULL,
         &pg_https_ca_file,
         "",
+        PGC_USERSET,
+        0,
+        NULL,
+        NULL,
+        NULL
+    );
+ /* ---- tcp keep alive  ---- */
+    DefineCustomIntVariable(
+        "pg_https.tcp_keepalive",
+        "Max tcp keep alive sec",
+        NULL,
+        &pg_https_tcp_keepalive,
+        120, /* default*/
+        1,/* min */
+        300, /* max */ //intentionally kept 
         PGC_USERSET,
         0,
         NULL,
@@ -214,7 +236,9 @@ Datum rest_request(PG_FUNCTION_ARGS)
     int retries = 0;
     int retry_delay_ms = 100;
     double retry_backoff = 2.0;
-
+    
+    int cancel_mode = 0; // default = abort
+    
     // body valena fix
     
     int body_len = 0;
@@ -239,7 +263,7 @@ Datum rest_request(PG_FUNCTION_ARGS)
 
     url    = text_to_cstring(url_text);
     
-    if(strlen(url) == 0 )
+    if(url == NULL || strlen(url) == 0 )
         ereport(ERROR, (errmsg("URL cannot be NULL")));
     
     // optional params
@@ -264,7 +288,7 @@ Datum rest_request(PG_FUNCTION_ARGS)
     // timeout 
     // if (PG_NARGS() > 4 && !PG_ARGISNULL(4)) // earlier when arg index mapping was not done
     //     timeout_override = PG_GETARG_INT32(4);
-    if (PG_NARGS() > ARG_TIMEOUT && !PG_ARGISNULL(ARG_TIMEOUT)) // now as index mapping is done
+    if (PG_NARGS() > ARG_TIMEOUT && !PG_ARGISNULL(ARG_TIMEOUT)) // now as index mapping is done, ARG_TIMEOUT
         timeout_override = PG_GETARG_INT32(ARG_TIMEOUT);
 
     // user CREDS
@@ -283,6 +307,11 @@ Datum rest_request(PG_FUNCTION_ARGS)
 
     if (PG_NARGS() > ARG_RETRY_BACKOFF && !PG_ARGISNULL(ARG_RETRY_BACKOFF))
         retry_backoff = PG_GETARG_FLOAT8(ARG_RETRY_BACKOFF);
+
+    if (PG_NARGS() > ARG_CANCEL_MODE && !PG_ARGISNULL(ARG_CANCEL_MODE)) cancel_mode = PG_GETARG_INT32(ARG_CANCEL_MODE);
+
+    // if (PG_NARGS() > ARG_TCP_KEEPALIVE && !PG_ARGISNULL(ARG_TCP_KEEPALIVE)) tcp_keepalive = PG_GETARG_INT32(ARG_TCP_KEEPALIVE);
+
 
     /* ---- Clamp retry params , safety - to prevent abuse ---- */
     if (retries < 0)
@@ -309,6 +338,7 @@ Datum rest_request(PG_FUNCTION_ARGS)
                 timeout_override, 
                 username, password,
                 retries, retry_delay_ms, retry_backoff
+                ,cancel_mode
             );
 /* https_execute(
     const char *url,const char *method,Jsonb *headers_jsonb,const char *req_body,int req_body_len,
@@ -325,7 +355,7 @@ Datum rest_request(PG_FUNCTION_ARGS)
         ereport(ERROR, (errmsg("internal error: null response")));
     
     /* ---- logging slow or failing req , keeping it simple and light ---- */
-    if (res->duration_ms > 1000 || res->status >= 400)
+    if (res->duration_ms > 1000 || res->status >= 400 || res->curl_error_code != 0)
         ereport(LOG,
             (errmsg("pg_https: %s %s --> %d (%d ms, %d bytes)",
                 method,

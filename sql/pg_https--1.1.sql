@@ -53,7 +53,8 @@ create or replace function requests.rest_request(
     headers jsonb default null, body text default null,
     timeout int default null,
     username text default null, password text default null 
-    ,retries int default 0,retry_delay_ms int default 100,retry_backoff float default 2.0--new
+    ,retries int default 0,retry_delay_ms int default 100,retry_backoff float default 2.0
+    ,cancel_mode int default 0 --,tcp_keepalive int default true -- placing keepalive as GUC instead 
 )
 -- returns here won't work
 -- RETURNS TABLE (

@@ -51,6 +51,11 @@ struct curl_buffer {
     StringInfoData data;
 };
 
+typedef struct https_curl_ctx
+{
+    https_cancel_mode cancel_mode;
+} https_curl_ctx;
+
 // merge default and user list safely
 struct curl_slist *merge_headers(struct curl_slist *default_list, struct curl_slist *user_list)
 {
@@ -78,8 +83,17 @@ progress_callback(void *clientp,
      * not checking INTR here , does a longjmp() from libcurl , which skips curls internal clean up and causing leaking the handle ssl ctx and socket
      * instead , sig libcurl to abort by non-0 , curl_easy_perform will then ret CURLE_ABORTED_BY_CALLBACK and then we will check for INTR
     */
+    // if (QueryCancelPending || ProcDiePending)
+    //     return 1;
+    // return 0;
     if (QueryCancelPending || ProcDiePending)
-        return 1;
+    {
+        https_curl_ctx *ctx = (https_curl_ctx *) clientp; // clientp seems garbage here
+
+        if (ctx->cancel_mode == HTTPS_CANCEL_ABORT) return 1;  // abort curl, hope for gracefully
+
+        if (ctx->cancel_mode == HTTPS_CANCEL_WAIT)  return 0;  // ignore cancel, continue request, assuming ,won't need it
+    }
     return 0;
 }
 
@@ -459,6 +473,7 @@ https_execute(
     const int timeout_override,
     const char *username,const char *password,
     int retries,int retry_delay_ms,double retry_backoff
+    ,int cancel_mode 
 )
 {
     // mem context 
@@ -482,7 +497,7 @@ https_execute(
 
     struct timespec start, end;
     int duration_ms = 0;
-    int effective_timeout = https_timeout;//--new
+    int effective_timeout = https_timeout; //
     long curl_tls_version = CURL_SSLVERSION_DEFAULT;
 
     JsonbParseState *state = NULL;
@@ -496,6 +511,10 @@ https_execute(
     char *headers_copy = NULL ; 
 
     JsonbValue key, val;
+
+    https_curl_ctx ctx;
+    ctx.cancel_mode = cancel_mode;
+    int tcp_keepalive = pg_https_tcp_keepalive;//--new
 
     CURL *curl = curl_easy_init();
     if (!curl)
@@ -615,9 +634,26 @@ https_execute(
         /* Compression, sys default */
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
 
+
         /* Interrupt + hang fix */
         curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, progress_callback);
+        curl_easy_setopt(curl, CURLOPT_XFERINFODATA, &ctx);// for intr
         curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+
+        /* keep-alive idle time to 120 seconds */
+        if (tcp_keepalive >0 )
+        {
+            /* enable TCP keep-alive for this transfer */
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
+
+            /* set keep-alive idle time to tcp_keepalive seconds */
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, tcp_keepalive);
+            /* interval time between keep-alive probes: 60 seconds */
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+        
+            /* maximum number of keep-alive probes: 3 */
+            curl_easy_setopt(curl, CURLOPT_TCP_KEEPCNT, 3L);
+        }
 
         /* prevent slow/stall/hanging conns */
         curl_easy_setopt(curl, CURLOPT_LOW_SPEED_LIMIT, 1L); // bytes/sec
@@ -760,7 +796,7 @@ https_execute(
 
             // pg_usleep((delay + jitter) * 1000); // delya 1st
             // delay = (int)(delay * retry_backoff);// inc delay for next attempt
-            sleepy(jitter,delay);
+            sleepy(delay,jitter);
             delay = (int)(delay*retry_backoff);
             if (delay > max_delay)
                 delay = max_delay;
@@ -797,7 +833,7 @@ https_execute(
 
             result->status = 0;
             // result->body = psprintf("curl error: %s", curl_easy_strerror(res));//might be lossing error buf details
-            result->body = psprintf("curl error: %s | %s", curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
+            result->body = psprintf("{\"error\":true,\"message\":\"%s\",\"detail\":\"%s\"}", curl_easy_strerror(res),errbuf[0] ? errbuf : "no detail");
             
             // result->headers = NULL;
             result->headers = DatumGetJsonbP(
