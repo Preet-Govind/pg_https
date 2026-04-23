@@ -71,6 +71,8 @@ extern bool https_verify_peer; // SSL certificate verfication
 
 extern int pg_https_tcp_keepalive;//keep alive tcp 
 
+extern int pg_https_http_version;
+
 typedef enum
 {
     HTTPS_CANCEL_ABORT = 0,

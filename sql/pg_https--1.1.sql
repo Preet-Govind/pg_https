@@ -16,7 +16,9 @@ set pg_https.connect_timeout = 30;
 
 set pg_https.tls_version = 13;--tls 1.3 , use 12 for 1.2
 set pg_https.verify_peer = true; -- false validate ssl cert
+set pg_https.tcp_keepalive = 0; 
 
+set pg_https.pg_https_http_version = 2 ;
 -- set pg_https.has_auth_header = false; // breaks per request correctness
 
 -- SET pg_https.default_headers = '{"User-Agent": "pg_https/1.1"}';
@@ -53,7 +55,7 @@ create or replace function requests.rest_request(
     headers jsonb default null, body text default null,
     timeout int default null,
     username text default null, password text default null 
-    ,retries int default 0,retry_delay_ms int default 100,retry_backoff float default 2.0
+    ,retries int default 0,retry_delay_ms int default 300,retry_backoff float default 2.0
     ,cancel_mode int default 0 --,tcp_keepalive int default true -- placing keepalive as GUC instead 
 )
 -- returns here won't work

@@ -53,6 +53,8 @@ char *pg_https_ca_file = NULL;
 
 int pg_https_tcp_keepalive = 120 ; // sec default
 
+int pg_https_http_version = 0; 
+
 extern void init_default_headers(void);
 
 
@@ -188,7 +190,7 @@ void _PG_init(void)
         NULL,
         &pg_https_tcp_keepalive,
         120, /* default*/
-        1,/* min */
+        0,/* min */ // curl default
         300, /* max */ //intentionally kept 
         PGC_USERSET,
         0,
@@ -196,6 +198,15 @@ void _PG_init(void)
         NULL,
         NULL
     );
+
+    DefineCustomIntVariable(
+    "pg_https.http_version",
+    "HTTP version (0=1.1, 2=HTTP/2)",
+    NULL,
+    &pg_https_http_version,
+    0, 0, 2,
+    PGC_USERSET, 0, NULL, NULL, NULL
+);
 }
 
 

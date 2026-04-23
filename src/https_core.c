@@ -14,6 +14,10 @@
 #include "utils/lsyscache.h"
 #include "catalog/pg_type.h"
 #include "utils/fmgrprotos.h"
+
+// #ifndef CURLOPT_TCP_KEEPCNT  // use curl 8.14
+// #define CURLOPT_TCP_KEEPCNT 3l
+// #endif
 // #include "utils/interrupt.h"
 
 /* 
@@ -525,6 +529,7 @@ https_execute(
     }
     PG_TRY();
     {
+        // curl_easy_setopt(curl, CURLOPT_VERBOSE, 1L); // uncomment to see verbose
         // parse default headers per req
         if (pg_https_default_headers && strlen(pg_https_default_headers) > 0)
         {
@@ -583,8 +588,9 @@ https_execute(
         curl_easy_setopt(curl, CURLOPT_CONNECTTIMEOUT, https_connect_timeout);// GUC defined
         // curl_easy_setopt(curl, CURLOPT_TIMEOUT, https_timeout);// GUC defined
 
-        if (timeout_override > 0)
-            effective_timeout = timeout_override;
+        // if (timeout_override > 0)   effective_timeout = timeout_override;
+        effective_timeout = (timeout_override > 0) ? timeout_override : https_timeout;// atleast https_timeout is maintained with effective timeout
+
 
         // prevents long blocking inside db backend
         // if (effective_timeout > 30)
@@ -626,10 +632,14 @@ https_execute(
             curl_easy_setopt(curl, CURLOPT_CAINFO, pg_https_ca_file);
         }
         /* HTTP/2 */
-        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        // curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2TLS);
+        curl_easy_setopt(curl, CURLOPT_HTTP_VERSION,(pg_https_http_version == 2)? CURL_HTTP_VERSION_2TLS: CURL_HTTP_VERSION_1_1);
 
         /* ALPN */
-        curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
+        // curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
+        /* only enable ALPN when HTTP/2 is explicitly requested */
+        if (pg_https_http_version == 2)
+            curl_easy_setopt(curl, CURLOPT_SSL_ENABLE_ALPN, 1L);
 
         /* Compression, sys default */
         curl_easy_setopt(curl, CURLOPT_ACCEPT_ENCODING, "");
@@ -664,6 +674,11 @@ https_execute(
         curl_easy_setopt(curl, CURLOPT_USERAGENT, "pg_https/1.1");
         
         curl_easy_setopt(curl, CURLOPT_NOSIGNAL, 1L); //libcurl may use signals
+        // may contribute to spikes in conns
+        // /* this second transfer may not reuse the same connection */ 
+        // curl_easy_setopt(curl, CURLOPT_FORBID_REUSE, 1L);
+        // /* this transfer must use a new connection, not reuse an existing */
+        // curl_easy_setopt(curl, CURLOPT_FRESH_CONNECT, 1L);
         
         /* ---- headers ---- */
 
@@ -725,7 +740,8 @@ https_execute(
 
         // retry loop with perform request & check res
         // res = curl_easy_perform(curl); // libcurl request // adding retry logic
-        int max_delay = 5000;  // 5 seconds cap , retry
+        
+        int max_delay = 10000;  // 10 seconds cap , retry
         char errbuf[CURL_ERROR_SIZE];
         errbuf[0] = '\0';
         curl_easy_setopt(curl, CURLOPT_ERRORBUFFER, errbuf);

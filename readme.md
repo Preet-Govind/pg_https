@@ -309,6 +309,7 @@ SELECT * FROM requests.rest_request(
 
 ## TESTED
 - Debian , PostgresSQL 17 : works smoothly
+- WSL Ubuntu 24.04 LTS : works , may require to download and make of curl 8.14.0
 
 ---
 
