@@ -8,6 +8,7 @@
 #include "access/htup_details.h"  // heap_form_tuple, HeapTuple // tuple construction
 // #include "utils/lsyscache.h"
 #include "utils/guc.h" // custom config - GUC
+#include "storage/ipc.h"
 #include <curl/curl.h>
 
 #include "https_core.h"
@@ -54,6 +55,7 @@ char *pg_https_ca_file = NULL;
 int pg_https_tcp_keepalive = 120 ; // sec default
 
 int pg_https_http_version = 0; 
+bool https_connection_reuse = true;
 
 extern void init_default_headers(void);
 
@@ -78,6 +80,7 @@ void _PG_init(void)
     if (!curl_initialized)// once per process
     {
         curl_global_init(CURL_GLOBAL_DEFAULT);
+        on_proc_exit(pg_https_cleanup, PointerGetDatum(NULL));
         curl_initialized = true;
     }
 
@@ -200,13 +203,26 @@ void _PG_init(void)
     );
 
     DefineCustomIntVariable(
-    "pg_https.http_version",
-    "HTTP version (0=1.1, 2=HTTP/2)",
-    NULL,
-    &pg_https_http_version,
-    0, 0, 2,
-    PGC_USERSET, 0, NULL, NULL, NULL
-);
+        "pg_https.http_version",
+        "HTTP version (0=1.1, 2=HTTP/2)",
+        NULL,
+        &pg_https_http_version,
+        0, 0, 2,
+        PGC_USERSET, 0, NULL, NULL, NULL
+    );
+
+    DefineCustomBoolVariable(
+        "pg_https.connection_reuse",
+        "Reuse HTTP connections across requests",
+        NULL,
+        &https_connection_reuse,
+        true,
+        PGC_USERSET,
+        0,
+        NULL,
+        NULL,
+        NULL
+    );
 }
 
 

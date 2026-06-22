@@ -72,6 +72,7 @@ extern bool https_verify_peer; // SSL certificate verfication
 extern int pg_https_tcp_keepalive;//keep alive tcp 
 
 extern int pg_https_http_version;
+extern bool https_connection_reuse;
 
 typedef enum
 {
@@ -79,10 +80,6 @@ typedef enum
     HTTPS_CANCEL_WAIT  = 1
 } https_cancel_mode;
 
-/* 
- * mem :
- *  - All fields are allocated in current memory context
- *  - Caller (Postgres function) does not free manually
- */
- 
+void pg_https_cleanup(int code, Datum arg);
+
 #endif
