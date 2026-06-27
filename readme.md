@@ -107,7 +107,6 @@ pg_https.default_headers    |   Default headers (JSON)	""
 
 
 
-
 SQL API Function
 ```sql
 requests.rest_request(
@@ -285,6 +284,7 @@ SELECT * FROM requests.rest_request(
 - Idempotent request safety
 - Interrupt-safe (supports cancel / statement_timeout)
 - HTTP/2 and compression support
+- Production-grade HTTP Response Headers parsing (lowercase keys + duplicate array mapping + "raw" fallback)
 
 ## Notes
 - Retries happen only for:
@@ -309,14 +309,8 @@ SELECT * FROM requests.rest_request(
 
 ## TESTED
 - Debian , PostgresSQL 17 : works smoothly
+- WSL Ubuntu 24.04 LTS : works , may require to download and make of curl 8.14.0
 
 ---
 
-**Note:** This code may produce C90 warnings because some variables are declared and initialized in a single statement, which is not strictly compliant with the C90 standard.
-```c
--- may trigger warning in c90
-int x = 5;
--- c90 prefers 
-int x ;
-x = 5;
-```
+**Note:** This extension compiles warning-free under strictly enforced C90 compiler flags (`-Wdeclaration-after-statement`). Variable declarations are kept at the top of their blocks to align with PostgreSQL's development standards.
