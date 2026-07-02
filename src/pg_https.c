@@ -59,6 +59,7 @@ bool https_connection_reuse = true;
 
 extern void init_default_headers(void);
 
+void _PG_init(void);
 
 /*
  *  extension init hook
