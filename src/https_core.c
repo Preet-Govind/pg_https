@@ -290,7 +290,11 @@ parse_headers_to_map(char *raw_headers)
     ctl.keysize = 256;
     ctl.entrysize = sizeof(header_entry);
 
+#ifdef HASH_STRINGS
     htab = hash_create("headers map", 32, &ctl, HASH_ELEM | HASH_STRINGS);
+#else
+    htab = hash_create("headers map", 32, &ctl, HASH_ELEM);
+#endif
 
     for (line = strtok_r(raw_headers, "\r\n", &saveptr);
          line != NULL;
@@ -305,7 +309,11 @@ parse_headers_to_map(char *raw_headers)
              * headers from previous redirects / 100-continue blocks.
              */
             hash_destroy(htab);
+#ifdef HASH_STRINGS
             htab = hash_create("headers map", 32, &ctl, HASH_ELEM | HASH_STRINGS);
+#else
+            htab = hash_create("headers map", 32, &ctl, HASH_ELEM);
+#endif
             continue;
         }
 
@@ -340,6 +348,7 @@ parse_headers_to_map(char *raw_headers)
             continue;
 
         /* Case-insensitive key normalisation */
+        memset(lower_key, 0, sizeof(lower_key));
         strlcpy(lower_key, k, sizeof(lower_key));
         for (p = lower_key; *p; p++)
             *p = pg_tolower((unsigned char)*p);
@@ -605,7 +614,9 @@ https_execute(
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPALIVE, 1L);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPIDLE, tcp_keepalive);
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPINTVL, 60L);
+#ifdef CURLOPT_TCP_KEEPCNT
             curl_easy_setopt(curl, CURLOPT_TCP_KEEPCNT, 3L);
+#endif
         }
 
         /* prevent slow/stall/hanging conns */
@@ -701,7 +712,11 @@ https_execute(
             if (attempt == retries)
                 break;
 
+#if PG_VERSION_NUM >= 150000
             jitter = pg_prng_uint32(&pg_global_prng_state) % 100;
+#else
+            jitter = random() % 100;
+#endif
             sleepy(delay, jitter);
             delay = (int)(delay * retry_backoff);
             if (delay > max_delay)
